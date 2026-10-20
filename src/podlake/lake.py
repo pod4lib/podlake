@@ -211,8 +211,10 @@ def apply_resource(
     Apply one ResourceSync resource for an org in a single transaction (one
     DuckLake snapshot), then advance the org's sync cursor to `last_modified`:
 
-    - "full"/"delta": `payload` is a (records_parquet, meta_parquet) pair; upsert
-      the records by pod_record_id (delete existing ids from both tables, insert
+    - "full": `payload` is a (records_parquet, meta_parquet) pair; replace all
+      of the org's rows in both tables with it.
+    - "delta": `payload` is a (records_parquet, meta_parquet) pair; upsert the
+      records by pod_record_id (delete existing ids from both tables, insert
       the new versions).
     - "deletes": `payload` is a list of pod_record_ids to delete from both tables.
 
@@ -227,26 +229,37 @@ def apply_resource(
         if kind in ("full", "delta"):
             assert isinstance(payload, tuple)
             records_pq, meta_pq = payload
-            # incoming ids come from meta (one row per record)
-            ids_subquery = "(SELECT pod_record_id FROM read_parquet(?))"
-            # Scope both deletes to the org partition. Without the `org =`
-            # predicate DuckLake can't prune, so the delete scans every org's
-            # data to find this resource's ids — a full-table scan that is very
-            # slow on a multi-org lake. Every id in the resource belongs to
-            # `org`, so restricting to it is safe.
+            # A full dump is the org's complete record set, so it replaces the
+            # org outright rather than upserting: records missing from it are
+            # gone. This is also the only way a full dump fits in memory. A
+            # partition-wide DELETE retires the org's data files whole and
+            # writes no delete files, whereas the upsert's `IN (<every id>)`
+            # tombstones nearly every row of the org in one transaction — for
+            # Stanford's 10M-record dump that was OOM-killed at 31 GB.
+            #
+            # Deltas do upsert by id, scoped to the org partition: without the
+            # `org =` predicate DuckLake can't prune, so the delete scans every
+            # org's data to find this resource's ids. Every id in the resource
+            # belongs to `org`, so restricting to it is safe.
+            if kind == "full":
+                where, params = "WHERE org = ?", [org]
+            else:
+                where = (
+                    "WHERE org = ? AND pod_record_id IN "
+                    "(SELECT pod_record_id FROM read_parquet(?))"
+                )
+                params = [org, str(meta_pq)]
             _timed(
                 con,
                 f"{org} {kind}: delete records",
-                f"DELETE FROM {RECORDS_TABLE} "
-                f"WHERE org = ? AND pod_record_id IN {ids_subquery}",
-                [org, str(meta_pq)],
+                f"DELETE FROM {RECORDS_TABLE} {where}",
+                params,
             )
             _timed(
                 con,
                 f"{org} {kind}: delete record_meta",
-                f"DELETE FROM {META_TABLE} "
-                f"WHERE org = ? AND pod_record_id IN {ids_subquery}",
-                [org, str(meta_pq)],
+                f"DELETE FROM {META_TABLE} {where}",
+                params,
             )
             _timed(
                 con,

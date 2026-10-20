@@ -148,6 +148,58 @@ def test_apply_resource_upsert_and_delete(tmp_path):
     con.close()
 
 
+def test_apply_resource_full_replaces_org(tmp_path):
+    con = lake.connect(read_only=False, config=_dev_config(tmp_path))
+    srpq, smpq = _write_org(
+        tmp_path,
+        "stanford",
+        [
+            _record("stanford", "a1", "Symphony", "k1"),
+            _record("stanford", "a2", "Sonata", "k2"),
+        ],
+    )
+    lake.load_pair(con, "stanford", srpq, smpq)
+    hrpq, hmpq = _write_org(
+        tmp_path, "harvard", [_record("harvard", "b1", "Symphony", "k1")]
+    )
+    lake.load_pair(con, "harvard", hrpq, hmpq)
+
+    # new full dump: a1 retitled, a2 withdrawn (absent), a3 new
+    frpq, fmpq = _write_org(
+        tmp_path,
+        "stanford-full",
+        [
+            _record("stanford", "a1", "Symphony (rev)", "k1"),
+            _record("stanford", "a3", "Concerto", "k3"),
+        ],
+    )
+    ts = datetime(2026, 2, 12, tzinfo=UTC)
+    changed, deleted = lake.apply_resource(con, "stanford", "full", (frpq, fmpq), ts)
+    assert (changed, deleted) == (2, 0)
+
+    # a2 is gone from both tables, not just superseded
+    for table in ("record_meta", "records"):
+        ids = [
+            r[0]
+            for r in con.execute(
+                f"SELECT DISTINCT pod_record_id FROM {table} ORDER BY 1"
+            ).fetchall()
+        ]
+        assert ids == ["harvard:b1", "stanford:a1", "stanford:a3"]
+
+    title = con.execute(
+        "SELECT value FROM records WHERE pod_record_id='stanford:a1' "
+        "AND field_tag='245' AND subfield_code='a'"
+    ).fetchone()
+    assert title == ("Symphony (rev)",)
+
+    # the old org's files are retired whole, leaving no tombstones to apply —
+    # the property that keeps a big full dump from exhausting memory
+    assert lake.pending_deletes(con) == (0, 0)
+    assert lake.get_cursor(con, "stanford") == ts
+    con.close()
+
+
 def test_apply_resource_empty_delta(tmp_path):
     con = lake.connect(read_only=False, config=_dev_config(tmp_path))
     srpq, smpq = _write_org(
