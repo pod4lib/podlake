@@ -286,6 +286,9 @@ def test_sync_log_file_quiets_console(tmp_path, monkeypatch):
 
     written = log.read_text()
     assert "downloading" in written
+    # download and conversion are timed separately: conversion is the slow part
+    assert "downloaded in " in written
+    assert "converted in " in written
     assert "resources processed" in written
     # The record count must survive the bar being disabled: tqdm.update() is a
     # no-op on a disabled bar, so reading progress.n logged "0 records" here
