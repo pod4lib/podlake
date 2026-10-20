@@ -425,6 +425,8 @@ def sync(
     Sync one organization from POD ResourceSync into the DuckLake. Processes
     every resource (full dump + deltas + deletes) newer than the org's cursor:
     the first run does a full initial load, later runs apply only new deltas.
+    Full dumps POD re-issues after that are skipped; rebuild the lake to apply
+    them.
     """
     _setup_logging(verbose, log)
     get_config()
@@ -586,6 +588,28 @@ def _sync_org(
     cursor = lake.get_cursor(con, org)
     resources = resourcesync.get_resources(resourcelist_url)
     pending = [r for r in resources if cursor is None or r.lastmod > cursor]
+
+    # Only an org's first full dump is applied; later ones are skipped and the
+    # deltas after them still apply. Replacing a loaded org needs a DELETE of
+    # every one of its rows, and DuckLake holds memory for each deleted row
+    # outside its memory_limit: Stanford's re-issued full dump was OOM-killed
+    # at 31 GB on every attempt. What a skipped dump would have changed beyond
+    # its deltas (mostly withdrawals sent without a delete file) waits for the
+    # next rebuild of the lake.
+    loaded = cursor is not None
+    kept = []
+    for r in pending:
+        if r.kind == "full":
+            if loaded:
+                _progress(
+                    f"{org}: skipping full dump of {r.lastmod:%Y-%m-%d} "
+                    f"({humanize.naturalsize(r.length)}) — the org is already "
+                    "loaded; rebuild the lake to apply it"
+                )
+                continue
+            loaded = True
+        kept.append(r)
+    pending = kept
 
     total = len(pending)
     if total:

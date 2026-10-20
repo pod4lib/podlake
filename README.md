@@ -159,6 +159,17 @@ The first run does the full initial load, and later runs apply only new deltas.
 You use the same command for both. Each resource is applied in its own transaction (one
 DuckLake snapshot) and advances the org's cursor, so an interrupted sync resumes
 cleanly. Run `sync-all` on a schedule (e.g. cron) to keep the lake current. 
+
+Only an organization's first full dump is loaded. When POD later re-issues one,
+sync logs that it is skipping it and carries on applying the deltas and deletes
+that follow. Replacing a loaded organization would mean deleting every one of
+its rows, and DuckLake's memory for a DELETE grows with the rows deleted,
+outside `PODLAKE_MEMORY_LIMIT`; a large organization's replace is OOM-killed on
+a 32GB box. A re-issued full dump can carry changes its deltas don't, mostly
+withdrawals sent without a delete file, so **rebuild the lake periodically** to
+pick them up: move the catalog and data path aside and run `sync-all` against
+an empty lake. A rebuild is also required after upgrading goldrush, because
+keys from different goldrush releases never match.
 Lower `--batch-size` (default 100000) on memory-constrained machines.
 
 The spill for large operations, and each resource's download/conversion, goes to
