@@ -177,7 +177,7 @@ def test_apply_resource_full_replaces_org(tmp_path):
     changed, deleted = lake.apply_resource(con, "stanford", "full", (frpq, fmpq), ts)
     assert (changed, deleted) == (2, 0)
 
-    # a2 is gone from both tables, not just superseded
+    # the withdrawn records are gone from both tables, not just superseded
     for table in ("record_meta", "records"):
         ids = [
             r[0]
@@ -193,10 +193,58 @@ def test_apply_resource_full_replaces_org(tmp_path):
     ).fetchone()
     assert title == ("Symphony (rev)",)
 
-    # the old org's files are retired whole, leaving no tombstones to apply —
-    # the property that keeps a big full dump from exhausting memory
     assert lake.pending_deletes(con) == (0, 0)
     assert lake.get_cursor(con, "stanford") == ts
+    con.close()
+
+
+def test_apply_resource_full_replaces_org_in_data_files(tmp_path):
+    # The test above is small enough that DuckLake inlines its rows into the
+    # catalog. This one writes real Parquet files, then gives stanford what a
+    # long-running lake has before a new full dump: files merged by compaction
+    # and an unapplied tombstone.
+    con = lake.connect(read_only=False, config=_dev_config(tmp_path))
+    lake.ensure_schema(con)
+    for org in ("stanford", "stanford", "harvard"):
+        for table, cols in (
+            ("records", "'245', 1, '1', '0', 'a', 0, 't'"),
+            ("record_meta", "'k' || i"),
+        ):
+            con.execute(
+                f"INSERT INTO {table} SELECT '{org}', '{org}:' || i, {cols} "
+                "FROM range(50000) s(i)"
+            )
+    lake.compact(con, days=0)
+    # big enough to write a delete file (small deletes are inlined too)
+    withdrawn = [f"stanford:{i}" for i in range(0, 50000, 5)]
+    lake.apply_resource(
+        con, "stanford", "deletes", withdrawn, datetime(2026, 2, 1, tzinfo=UTC)
+    )
+    assert lake.pending_deletes(con)[1] > 0
+
+    frpq, fmpq = _write_org(
+        tmp_path,
+        "stanford-full",
+        [
+            _record("stanford", "a1", "Symphony", "k1"),
+            _record("stanford", "a2", "Sonata", "k2"),
+        ],
+    )
+    ts = datetime(2026, 2, 12, tzinfo=UTC)
+    lake.apply_resource(con, "stanford", "full", (frpq, fmpq), ts)
+
+    for table in ("record_meta", "records"):
+        counts = dict(
+            con.execute(
+                f"SELECT org, count(DISTINCT pod_record_id) FROM {table} GROUP BY org"
+            ).fetchall()
+        )
+        assert counts == {"stanford": 2, "harvard": 50000}
+
+    # stanford's old files were retired whole, so the tombstone on them is no
+    # longer pending — the property that keeps a big full dump from exhausting
+    # memory
+    assert lake.pending_deletes(con) == (0, 0)
     con.close()
 
 

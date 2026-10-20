@@ -200,6 +200,48 @@ def _timed(
     logger.info("← %s (%.1fs)", label, time.perf_counter() - start)
 
 
+def _timed_org_delete(
+    con: duckdb.DuckDBPyConnection, org: str, kind: str, table: str
+) -> None:
+    """
+    Delete every row of `org` from `table`, one data file at a time.
+
+    A single `DELETE ... WHERE org = ?` does retire the files whole (no delete
+    files are written), but on the way it holds every matching row id in memory,
+    outside DuckDB's buffer pool, so `memory_limit` doesn't cap it: measured
+    peak RSS grew linearly, ~11 bytes/row with 10M-row files and ~40 with one
+    300M-row file. Deleting each file's rowid range instead bounds the peak by
+    the largest file (1.4 GB whether the org had 300M or 600M rows), and staying
+    inside the caller's transaction keeps the replace atomic.
+
+    DuckLake gives each data file the rowid range [row_id_start, row_id_start +
+    record_count). The final org-wide DELETE is the backstop for any rows that
+    range misses; when the per-file pass got them all it has nothing to hold.
+    """
+    files = con.execute(
+        "SELECT f.row_id_start, f.record_count "
+        f"FROM __ducklake_metadata_{LAKE_ALIAS}.ducklake_data_file f "
+        f"JOIN __ducklake_metadata_{LAKE_ALIAS}.ducklake_table t USING (table_id) "
+        f"JOIN __ducklake_metadata_{LAKE_ALIAS}.ducklake_file_partition_value p "
+        "USING (data_file_id) "
+        "WHERE t.table_name = ? AND t.end_snapshot IS NULL "
+        "AND f.end_snapshot IS NULL AND f.row_id_start IS NOT NULL "
+        "AND p.partition_value = ? "
+        "ORDER BY f.row_id_start",
+        [table, org],
+    ).fetchall()
+    label = f"{org} {kind}: delete {table}"
+    logger.info("→ %s (%d data files)", label, len(files))
+    start = time.perf_counter()
+    for row_id_start, record_count in files:
+        con.execute(
+            f"DELETE FROM {table} WHERE org = ? AND rowid BETWEEN ? AND ?",
+            [org, row_id_start, row_id_start + record_count - 1],
+        )
+    con.execute(f"DELETE FROM {table} WHERE org = ?", [org])
+    logger.info("← %s (%.1fs)", label, time.perf_counter() - start)
+
+
 def apply_resource(
     con: duckdb.DuckDBPyConnection,
     org: str,
@@ -229,38 +271,28 @@ def apply_resource(
         if kind in ("full", "delta"):
             assert isinstance(payload, tuple)
             records_pq, meta_pq = payload
-            # A full dump is the org's complete record set, so it replaces the
-            # org outright rather than upserting: records missing from it are
-            # gone. This is also the only way a full dump fits in memory. A
-            # partition-wide DELETE retires the org's data files whole and
-            # writes no delete files, whereas the upsert's `IN (<every id>)`
-            # tombstones nearly every row of the org in one transaction — for
-            # Stanford's 10M-record dump that was OOM-killed at 31 GB.
-            #
-            # Deltas do upsert by id, scoped to the org partition: without the
-            # `org =` predicate DuckLake can't prune, so the delete scans every
-            # org's data to find this resource's ids. Every id in the resource
-            # belongs to `org`, so restricting to it is safe.
             if kind == "full":
-                where, params = "WHERE org = ?", [org]
+                # A full dump is the org's complete record set, so it replaces
+                # the org outright rather than upserting: records missing from
+                # it are gone. An upsert's `IN (<every id>)` tombstones nearly
+                # every row of the org in one transaction — for Stanford's
+                # 10M-record dump that was OOM-killed at 31 GB.
+                for table in (RECORDS_TABLE, META_TABLE):
+                    _timed_org_delete(con, org, kind, table)
             else:
-                where = (
-                    "WHERE org = ? AND pod_record_id IN "
-                    "(SELECT pod_record_id FROM read_parquet(?))"
-                )
-                params = [org, str(meta_pq)]
-            _timed(
-                con,
-                f"{org} {kind}: delete records",
-                f"DELETE FROM {RECORDS_TABLE} {where}",
-                params,
-            )
-            _timed(
-                con,
-                f"{org} {kind}: delete record_meta",
-                f"DELETE FROM {META_TABLE} {where}",
-                params,
-            )
+                # Deltas upsert by id, scoped to the org partition: without the
+                # `org =` predicate DuckLake can't prune, so the delete scans
+                # every org's data to find this resource's ids. Every id in the
+                # resource belongs to `org`, so restricting to it is safe.
+                ids_subquery = "(SELECT pod_record_id FROM read_parquet(?))"
+                for table in (RECORDS_TABLE, META_TABLE):
+                    _timed(
+                        con,
+                        f"{org} {kind}: delete {table}",
+                        f"DELETE FROM {table} "
+                        f"WHERE org = ? AND pod_record_id IN {ids_subquery}",
+                        [org, str(meta_pq)],
+                    )
             _timed(
                 con,
                 f"{org} {kind}: insert records",
@@ -383,10 +415,15 @@ def pending_deletes(con: duckdb.DuckDBPyConnection) -> tuple[int, int]:
     if not _table_exists(con, RECORDS_TABLE):
         return (0, 0)
     # DuckLake's bookkeeping lives in a side catalog, not in the lake itself
+    # Only delete files on live data files count. Retiring a data file (as a
+    # full dump's replace does) leaves its delete files marked live until
+    # cleanup, but nothing ever reads them again, so they cost no memory.
     row = con.execute(
-        "SELECT count(*), coalesce(sum(delete_count), 0) "
-        f"FROM __ducklake_metadata_{LAKE_ALIAS}.ducklake_delete_file "
-        "WHERE end_snapshot IS NULL"
+        "SELECT count(*), coalesce(sum(d.delete_count), 0) "
+        f"FROM __ducklake_metadata_{LAKE_ALIAS}.ducklake_delete_file d "
+        f"JOIN __ducklake_metadata_{LAKE_ALIAS}.ducklake_data_file f "
+        "USING (data_file_id) "
+        "WHERE d.end_snapshot IS NULL AND f.end_snapshot IS NULL"
     ).fetchone()
     return (int(row[0]), int(row[1])) if row else (0, 0)
 
