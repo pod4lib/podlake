@@ -96,8 +96,8 @@ def load_pair(
 
     con.execute("BEGIN TRANSACTION")
     try:
-        con.execute(f"DELETE FROM {RECORDS_TABLE} WHERE org = ?", [org])
-        con.execute(f"DELETE FROM {META_TABLE} WHERE org = ?", [org])
+        for table in (RECORDS_TABLE, META_TABLE):
+            _timed_org_delete(con, org, "load", table)
         con.execute(
             f"INSERT INTO {RECORDS_TABLE} SELECT * FROM read_parquet(?)",
             [str(records_parquet)],
