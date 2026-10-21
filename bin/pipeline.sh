@@ -157,20 +157,23 @@ if [ -n "$publish_blocked" ]; then
 fi
 
 # --- 1. bring the lake up to date --------------------------------------------
-# --log is podlake's unattended mode: per-resource progress and the end-of-run
-# totals go to that file, with no progress bars, which keeps pipeline.log a
-# skimmable timeline rather than thousands of lines. Errors still land here.
+# --log is podlake's unattended mode: timestamped per-resource progress and the
+# end-of-run totals, with no progress bars. It goes to pipeline.log itself, so
+# one file tells the whole run in order — and the failure mail's tail shows the
+# step a sync died in, not just the `time` line after it. podlake's log handler
+# appends, like the redirect above, so the two writers interleave by line
+# rather than overwriting each other.
 echo "--- podlake sync-all"
 # cd, so podlake reads its own .env and resolves its relative data path.
 cd "$PODLAKE_DIR"
-time uv run podlake sync-all --log "$LOG_DIR/sync.log"
+time uv run podlake sync-all --log "$LOG_DIR/pipeline.log"
 
 # --- 2. reclaim disk and apply the delete backlog ----------------------------
 # Sync clears only as much backlog as its own writes need; this is what reclaims
 # the space. It also leaves the data files with their deletes physically applied,
 # so the extract below doesn't pay to merge tombstones on every query it runs.
 echo "--- podlake compact"
-time uv run podlake compact --log "$LOG_DIR/compact.log"
+time uv run podlake compact --log "$LOG_DIR/pipeline.log"
 
 # --- 3. republish the dashboard's aggregates ---------------------------------
 # The long pole: about 65 minutes against the full 13-institution lake, and it
