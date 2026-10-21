@@ -256,6 +256,48 @@ def test_sync_loads_into_lake(tmp_path, monkeypatch):
     con.close()
 
 
+def test_first_sync_starts_at_latest_full_dump(tmp_path, monkeypatch):
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    def at(day):
+        return datetime.datetime(2026, 2, day, tzinfo=datetime.UTC)
+
+    # an old full + its deletes, then a newer full (a1 + a2) + a delta (a1, a2)
+    resources = [
+        Resource(f"{BASE}/1/brown-2026-02-01-full-marcxml.xml.gz",
+                 "application/gzip", 1, "", at(1), "full"),
+        Resource(f"{BASE}/2/brown-2026-02-02-delta-deletes.del.txt",
+                 "text/plain", 1, "", at(2), "deletes"),
+        Resource(f"{BASE}/3/brown-2026-02-10-full-marcxml.xml.gz",
+                 "application/gzip", 1, "", at(10), "full"),
+        Resource(f"{BASE}/4/brown-2026-02-11-delta-marcxml.xml.gz",
+                 "application/gzip", 1, "", at(11), "delta"),
+    ]  # fmt: skip
+    monkeypatch.setattr(resourcesync, "get_resources", lambda url: resources)
+    downloaded = []
+
+    def download(url, path, fixity=None, desc=None, quiet=False):
+        downloaded.append(url)
+        return _fake_download(url, path, fixity, desc, quiet)
+
+    monkeypatch.setattr(resourcesync, "download", download)
+
+    result = runner.invoke(app, ["sync", "brown"])
+    assert result.exit_code == 0, result.output
+    # nothing older than the latest full dump is fetched, and none is skipped
+    assert downloaded == [resources[2].url, resources[3].url]
+    assert "skipping" not in result.output
+
+    con = lake.connect(read_only=False, config=get_config())
+    ids = con.execute("SELECT pod_record_id FROM record_meta ORDER BY 1").fetchall()
+    assert ids == [("brown:a1",), ("brown:a2",)]
+    assert lake.get_cursor(con, "brown") == at(11)
+    con.close()
+
+
 def test_sync_skips_full_dump_once_org_is_loaded(tmp_path, monkeypatch):
     _patch(monkeypatch)
     monkeypatch.setenv("PODLAKE_PROFILE", "file")

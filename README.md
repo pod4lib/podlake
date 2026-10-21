@@ -160,9 +160,10 @@ You use the same command for both. Each resource is applied in its own transacti
 DuckLake snapshot) and advances the org's cursor, so an interrupted sync resumes
 cleanly. Run `sync-all` on a schedule (e.g. cron) to keep the lake current. 
 
-Only an organization's first full dump is loaded. When POD later re-issues one,
-sync logs that it is skipping it and carries on applying the deltas and deletes
-that follow. Replacing a loaded organization would mean deleting every one of
+An organization's first sync starts at the latest full dump in its resource list
+and ignores anything older. Once it is loaded, full dumps are skipped: when POD
+re-issues one, sync logs that it is skipping it and carries on applying the
+deltas and deletes that follow. Replacing a loaded organization would mean deleting every one of
 its rows, and DuckLake's memory for a DELETE grows with the rows deleted,
 outside `PODLAKE_MEMORY_LIMIT`; a large organization's replace is OOM-killed on
 a 32GB box. A re-issued full dump can carry changes its deltas don't, mostly
