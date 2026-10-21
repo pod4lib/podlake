@@ -94,6 +94,13 @@ def _progress(msg: str) -> None:
         typer.echo(msg, err=True)
 
 
+def _elapsed(started: float) -> str:
+    """Time since `started` (a perf_counter reading), e.g. "2 hours and 13 minutes"."""
+    return humanize.precisedelta(
+        time.perf_counter() - started, minimum_unit="seconds", format="%0.0f"
+    )
+
+
 def _summary(plain: str, rich_markup: str) -> None:
     """An end-of-command summary: logged with --log, printed otherwise."""
     if _LOGGING_TO_FILE:
@@ -417,7 +424,9 @@ def sync(
     """
     Sync one organization from POD ResourceSync into the DuckLake. Processes
     every resource (full dump + deltas + deletes) newer than the org's cursor:
-    the first run does a full initial load, later runs apply only new deltas.
+    the first run loads the latest full dump and what follows it, later runs
+    apply only new deltas. Full dumps POD re-issues after that are skipped;
+    rebuild the lake to apply them.
     """
     _setup_logging(verbose, log)
     get_config()
@@ -580,6 +589,28 @@ def _sync_org(
     resources = resourcesync.get_resources(resourcelist_url)
     pending = [r for r in resources if cursor is None or r.lastmod > cursor]
 
+    # A full dump is the org's complete state as of its date, so a first load
+    # starts at the latest one and ignores everything older. Once the org is
+    # loaded, full dumps are skipped and the deltas after them still apply.
+    # Replacing a loaded org needs a DELETE of every one of its rows, and
+    # DuckLake holds memory for each deleted row outside its memory_limit:
+    # Stanford's re-issued full dump was OOM-killed at 31 GB on every attempt.
+    # What a skipped dump would have changed beyond its deltas (mostly
+    # withdrawals sent without a delete file) waits for the next rebuild.
+    fulls = [i for i, r in enumerate(pending) if r.kind == "full"]
+    if cursor is None:
+        if fulls:
+            pending = pending[fulls[-1] :]
+    else:
+        for i in fulls:
+            r = pending[i]
+            _progress(
+                f"{org}: skipping full dump of {r.lastmod:%Y-%m-%d} "
+                f"({humanize.naturalsize(r.length)}) — the org is already "
+                "loaded; rebuild the lake to apply it"
+            )
+        pending = [r for r in pending if r.kind != "full"]
+
     total = len(pending)
     if total:
         size = humanize.naturalsize(sum(r.length for r in pending))
@@ -622,6 +653,7 @@ def _sync_org(
             else:
                 suffix = ".xml.gz" if resource.url.endswith(".gz") else ".xml"
                 dl_path = Path(tmp) / f"resource{suffix}"
+                started = time.perf_counter()
                 resourcesync.download(
                     resource.url,
                     dl_path,
@@ -629,6 +661,15 @@ def _sync_org(
                     desc=f"{pos} {org} {resource.kind}: downloading",
                     quiet=_LOGGING_TO_FILE,
                 )
+                # Timed separately because the two are easy to confuse in the
+                # log: a 6.4 GB full dump downloads in about a minute and then
+                # converts for two hours.
+                if _download_bar_hidden():
+                    _progress(
+                        f"  {pos} {org} {resource.kind}: downloaded in "
+                        f"{_elapsed(started)}, converting to Parquet…"
+                    )
+                started = time.perf_counter()
                 records_pq = Path(tmp) / "records.parquet"
                 meta_pq = Path(tmp) / "meta.parquet"
                 # Track the count ourselves rather than reading progress.n:
@@ -659,8 +700,8 @@ def _sync_org(
                 # apply_resource runs a delete+insert upsert with no progress of
                 # its own; announce it so the wait isn't mistaken for a stall.
                 _progress(
-                    f"  {pos} {org} {resource.kind}: updating the lake with "
-                    f"{seen:,} records…"
+                    f"  {pos} {org} {resource.kind}: converted in "
+                    f"{_elapsed(started)}; updating the lake with {seen:,} records…"
                 )
                 changed, _ = lake.apply_resource(
                     con, org, resource.kind, (records_pq, meta_pq), resource.lastmod

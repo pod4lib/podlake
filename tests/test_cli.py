@@ -256,6 +256,86 @@ def test_sync_loads_into_lake(tmp_path, monkeypatch):
     con.close()
 
 
+def test_first_sync_starts_at_latest_full_dump(tmp_path, monkeypatch):
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    def at(day):
+        return datetime.datetime(2026, 2, day, tzinfo=datetime.UTC)
+
+    # an old full + its deletes, then a newer full (a1 + a2) + a delta (a1, a2)
+    resources = [
+        Resource(f"{BASE}/1/brown-2026-02-01-full-marcxml.xml.gz",
+                 "application/gzip", 1, "", at(1), "full"),
+        Resource(f"{BASE}/2/brown-2026-02-02-delta-deletes.del.txt",
+                 "text/plain", 1, "", at(2), "deletes"),
+        Resource(f"{BASE}/3/brown-2026-02-10-full-marcxml.xml.gz",
+                 "application/gzip", 1, "", at(10), "full"),
+        Resource(f"{BASE}/4/brown-2026-02-11-delta-marcxml.xml.gz",
+                 "application/gzip", 1, "", at(11), "delta"),
+    ]  # fmt: skip
+    monkeypatch.setattr(resourcesync, "get_resources", lambda url: resources)
+    downloaded = []
+
+    def download(url, path, fixity=None, desc=None, quiet=False):
+        downloaded.append(url)
+        return _fake_download(url, path, fixity, desc, quiet)
+
+    monkeypatch.setattr(resourcesync, "download", download)
+
+    result = runner.invoke(app, ["sync", "brown"])
+    assert result.exit_code == 0, result.output
+    # nothing older than the latest full dump is fetched, and none is skipped
+    assert downloaded == [resources[2].url, resources[3].url]
+    assert "skipping" not in result.output
+
+    con = lake.connect(read_only=False, config=get_config())
+    ids = con.execute("SELECT pod_record_id FROM record_meta ORDER BY 1").fetchall()
+    assert ids == [("brown:a1",), ("brown:a2",)]
+    assert lake.get_cursor(con, "brown") == at(11)
+    con.close()
+
+
+def test_sync_skips_full_dump_once_org_is_loaded(tmp_path, monkeypatch):
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+    assert runner.invoke(app, ["sync", "brown"]).exit_code == 0  # leaves a1
+
+    # POD re-issues a full dump (a1 + a2), then a deletes file removing a1.
+    # Applied, the full would bring a2 back; skipped, nothing is left.
+    full_ts = datetime.datetime(2026, 2, 20, tzinfo=datetime.UTC)
+    del_ts = datetime.datetime(2026, 2, 21, tzinfo=datetime.UTC)
+    later = [
+        Resource(f"{BASE}/4/brown-2026-02-20-full-marcxml.xml.gz",
+                 "application/gzip", 6_400_000_000, "", full_ts, "full"),
+        Resource(f"{BASE}/5/brown-2026-02-21-delta-deletes.del.txt",
+                 "text/plain", 1, "", del_ts, "deletes"),
+    ]  # fmt: skip
+    monkeypatch.setattr(resourcesync, "get_resources", lambda url: _resources() + later)
+    downloaded = []
+
+    def download(url, path, fixity=None, desc=None, quiet=False):
+        downloaded.append(url)
+        path.write_text("a1\n")
+        return path
+
+    monkeypatch.setattr(resourcesync, "download", download)
+
+    result = runner.invoke(app, ["sync", "brown"])
+    assert result.exit_code == 0, result.output
+    assert "brown: skipping full dump of 2026-02-20 (6.4 GB)" in result.output
+    assert downloaded == [later[1].url]  # the skipped dump is never fetched
+
+    con = lake.connect(read_only=False, config=get_config())
+    assert con.execute("SELECT count(*) FROM record_meta").fetchone() == (0,)
+    assert lake.get_cursor(con, "brown") == del_ts
+    con.close()
+
+
 def test_sync_verbose_logs_apply_steps(tmp_path, monkeypatch):
     """--verbose must actually surface the per-statement markers: they are what
     pins a stall or memory spike to a specific step (delete vs insert)."""
@@ -286,6 +366,9 @@ def test_sync_log_file_quiets_console(tmp_path, monkeypatch):
 
     written = log.read_text()
     assert "downloading" in written
+    # download and conversion are timed separately: conversion is the slow part
+    assert "downloaded in " in written
+    assert "converted in " in written
     assert "resources processed" in written
     # The record count must survive the bar being disabled: tqdm.update() is a
     # no-op on a disabled bar, so reading progress.n logged "0 records" here
