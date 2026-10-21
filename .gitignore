@@ -9,7 +9,6 @@ wheels/
 # Virtual environments
 .venv
 .env
-uv.lock
 
 # Harvested data and local DuckLake artifacts
 *.parquet
