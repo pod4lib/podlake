@@ -13,7 +13,7 @@ dependencies = [
   "lxml>=5.0",
   "tqdm>=4.0.0",
   "goldrush>=0.6.0",
-  "duckdb>=1.5.6,<2",
+  "duckdb>=2.0.0",
   "pymarc>=5.0",
   "pyarrow>=16.0",
 ]
