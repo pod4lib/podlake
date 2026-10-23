@@ -137,7 +137,7 @@ local Parquet — ideal for building a lake locally and then publishing it:
 PODBUCKET_POD_TOKEN=your-pod-token
 PODLAKE_PROFILE=file
 PODLAKE_CATALOG=podlake.ducklake         # local catalog file (default)
-PODLAKE_DATA_PATH=./lake-data/           # where Parquet data files live (default)
+PODLAKE_DATA_PATH=./lake-data/           # where Parquet data files live (default; made absolute)
 PODLAKE_PUBLISH_URL=s3://your-bucket/pod # optional default target for `publish`
 ```
 
@@ -199,16 +199,21 @@ USE podlake;
 
 -- a local file-catalog lake
 INSTALL ducklake;
-ATTACH 'ducklake:podlake.ducklake' AS podlake (DATA_PATH './lake-data/', READ_ONLY);
+ATTACH 'ducklake:podlake.ducklake' AS podlake
+  (DATA_PATH './lake-data/', READ_ONLY, OVERRIDE_DATA_PATH true);
 USE podlake;
 ```
 
-`OVERRIDE_DATA_PATH true` re-roots the published catalog at the bucket. A public
-bucket needs no credentials; for a private one, consumers supply read-only AWS
-credentials via `CREATE SECRET (TYPE s3, ...)`. Thanks to snapshot isolation the
-maintainer can republish while analysts keep querying, and a reader can pin a
-version with `FROM records AT (VERSION => N)`. See the schema section above for
-query patterns.
+`OVERRIDE_DATA_PATH true` re-roots the published catalog at the bucket, and lets
+the local example pass a relative path: podlake records the data path in the
+catalog as an absolute one (under DuckDB 2.0, a relative one would tie the data
+files to the directory podlake ran in).
+
+A public bucket needs no credentials; for a private one, consumers supply
+read-only AWS credentials via `CREATE SECRET (TYPE s3, ...)`. Thanks to snapshot
+isolation the maintainer can republish while analysts keep querying, and a
+reader can pin a version with `FROM records AT (VERSION => N)`. See the schema
+section above for query patterns.
 
 ## Running the whole pipeline on a schedule
 

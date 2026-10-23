@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import dotenv
 
@@ -102,6 +103,14 @@ def get_config() -> Config:
 def _file_config() -> Config:
     catalog = os.environ.get("PODLAKE_CATALOG", "podlake.ducklake")
     data_path = os.environ.get("PODLAKE_DATA_PATH", "./lake-data/")
+    # DuckLake under DuckDB 2.0 records each data file under a relative DATA_PATH
+    # as a plain path relative to the writer's working directory (for example
+    # "lake-data/main/records/org=mit/…", not relative to the data path). Readers
+    # resolve that against their own working directory, where OVERRIDE_DATA_PATH
+    # doesn't reach: podlake-web's refresh, run from its own checkout, failed with
+    # "Cannot open file". An absolute DATA_PATH gets file paths relative to it.
+    if not data_path.startswith("s3://"):
+        data_path = str(Path(data_path).resolve()) + "/"
     return Config(
         profile="file",
         data_path=data_path,

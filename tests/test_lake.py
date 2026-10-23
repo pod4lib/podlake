@@ -8,7 +8,7 @@ import moto
 import pytest
 
 from podlake import lake
-from podlake.config import Config
+from podlake.config import Config, get_config
 
 
 def _dev_config(tmp_path: Path) -> Config:
@@ -63,6 +63,44 @@ def _write_org(tmp_path, name, records):
     _records_parquet(rpq, rec_rows)
     _meta_parquet(mpq, meta_rows)
     return rpq, mpq
+
+
+def test_default_data_path_lake_reads_from_another_directory(tmp_path, monkeypatch):
+    """
+    podlake-web reads the lake from its own checkout, so data file paths must not
+    depend on the working directory podlake wrote them from.
+    """
+    writer, reader = tmp_path / "podlake", tmp_path / "podlake-web"
+    writer.mkdir()
+    reader.mkdir()
+    monkeypatch.chdir(writer)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.delenv("PODLAKE_CATALOG", raising=False)
+    monkeypatch.delenv("PODLAKE_DATA_PATH", raising=False)
+
+    config = get_config()
+    assert config.data_path == str(writer / "lake-data") + "/"
+
+    con = lake.connect(config=config)
+    lake.ensure_schema(con)
+    # enough rows to be written to a Parquet file rather than inlined in the catalog
+    con.execute(
+        "INSERT INTO records SELECT 'mit', 'mit:' || i, '245', 1, '1', '0', 'a', 0, "
+        "'title ' || i FROM range(50000) r(i)"
+    )
+    con.close()
+
+    monkeypatch.chdir(reader)
+    con = duckdb.connect()
+    con.execute("LOAD ducklake")
+    con.execute(
+        f"ATTACH 'ducklake:{writer}/podlake.ducklake' AS l "
+        f"(DATA_PATH '{writer}/lake-data/', OVERRIDE_DATA_PATH true, READ_ONLY)"
+    )
+    # count(*), min() and max() can come from catalog statistics; this has to
+    # open the Parquet file
+    total = con.execute("SELECT sum(length(value)) FROM l.records").fetchone()
+    assert total == (sum(len(f"title {i}") for i in range(50000)),)
 
 
 def test_load_pair_and_overlap(tmp_path):
